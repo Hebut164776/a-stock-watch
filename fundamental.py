@@ -1,12 +1,24 @@
 """
 基本面数据抓取模块
-通过东方财富 HTTP API（非HTTPS）获取估值和财务数据
-回避 HTTPS 被系统网络限制的问题
+通过 AKShare（东方财富底层）获取 PE/PB/营收/净利润/ROE 等数据
+
+注：需要设置 NO_PROXY 环境变量绕过系统代理对东方财富 HTTPS 的限制
 """
 
+import os
 import re
+
+# AKShare 需要 NO_PROXY 绕过系统代理
+_NO_EASTMONEY = 'push2.eastmoney.com,push2his.eastmoney.com,*.eastmoney.com,eastmoney.com,emweb.securities.eastmoney.com'
+_existing = os.environ.get('NO_PROXY', '')
+if _NO_EASTMONEY not in _existing:
+    os.environ['NO_PROXY'] = f"{_NO_EASTMONEY},{_existing}" if _existing else _NO_EASTMONEY
+
 import requests
-from datetime import datetime
+import akshare as ak
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
 
 HEADERS = {
     "Referer": "https://quote.eastmoney.com",
@@ -18,224 +30,222 @@ HEADERS = {
 }
 
 
+def _safe_float(v):
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_val(row, df, offset=0):
+    """获取行中最新（第2列开始偏移）的值"""
+    col = df.columns[2 + offset] if 2 + offset < len(df.columns) else None
+    if col:
+        return _safe_float(row.get(col))
+    return None
+
+
+def _latest_cols(df, n=4):
+    """返回最新的n列名"""
+    return list(df.columns[2:2+n])
+
+
 def fetch_valuation(code):
     """
     获取股票的估值数据（PE/PB/总市值）
-    使用东方财富 HTTP API
+    使用东方财富 HTTP API（非HTTPS）
 
     Args:
         code: 股票代码
 
     Returns:
-        dict: {pe, pb, total_mv, name} 或 None
+        dict: {pe, pb, total_mv, name}
     """
-    market = 1 if code.startswith(("6", "9")) else 0  # 1=沪 0=深
+    market = 1 if code.startswith(("6", "9")) else 0
     url = "http://push2.eastmoney.com/api/qt/stock/get"
     params = {
         "secid": f"{market}.{code}",
         "fltt": "2",
-        "fields": "f57,f58,f116,f162,f167,f43,f170",
+        "fields": "f57,f58,f116,f162,f167",
     }
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        data = resp.json()
-        d = data.get("data")
+        d = resp.json().get("data")
         if not d:
             return None
-
         pe = d.get("f162")
         pb = d.get("f167")
         total_mv = d.get("f116")
-        name = d.get("f58", "")
-        price = d.get("f43", 0)
-        change_pct = d.get("f170", 0)
-
-        result = {
+        return {
             "code": code,
-            "name": name,
+            "name": d.get("f58", ""),
             "pe": round(float(pe), 2) if pe and float(pe) > 0 else None,
             "pb": round(float(pb), 2) if pb and float(pb) > 0 else None,
-            "total_mv": round(float(total_mv) / 1e8, 2) if total_mv else None,  # 亿
-            "price": float(price) / 100 if price else None,
-            "change_pct": float(change_pct) / 100 if change_pct else None,
+            "total_mv": round(float(total_mv) / 1e8, 2) if total_mv else None,
         }
-        return result
     except Exception:
         return None
 
 
-def fetch_financial_summary(code):
-    """
-    从东方财富 HTTP API 获取财务指标摘要
-
-    注意：免费接口无法稳定获取营收增速和净利润增速，
-    需要这些数据的用户可在券商APP核实后手动填入。
-
-    Args:
-        code: 股票代码
-
-    Returns:
-        dict: 财务数据
-    """
+def _fetch_financials_impl(code):
+    """实际的AKShare财务数据抓取（由超时包装器调用）"""
     result = {
-        "revenue_yoy": None,    # 营收同比(%)
-        "profit_yoy": None,     # 净利润同比(%)
-        "roe": None,            # 净资产收益率(%)
-        "eps": None,            # 每股收益
-        "report_date": None,    # 报告期
+        "revenue_yoy": None,
+        "profit_yoy": None,
+        "roe": None,
+        "eps": None,
+        "gross_margin": None,
+        "report_date": None,
     }
-
-    # 东方财富 datacenter-web API（HTTP 方式）
-    # 财务数据接口需要特定的 reportName，不同环境可能不同
-    # 这里尝试股票基本面核心指标
     try:
-        url = "http://datacenter-web.eastmoney.com/api/data/v1/get"
-        params = {
-            "reportName": "RPT_LICO_FN_CPD",
-            "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,REPORT_DATE,EPS,WEIGHTAVG_ROE,GROSS_PROFIT_MARGIN",
-            "filter": f'(SECURITY_CODE="{code}")',
-            "pageNumber": 1,
-            "pageSize": 1,
-            "sortTypes": -1,
-            "sortColumns": "NOTICE_DATE",
-            "source": "WEB",
-            "client": "WEB",
-        }
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        data = resp.json()
-        if data.get("result") and data["result"].get("data"):
-            d = data["result"]["data"][0]
-            result["eps"] = float(d.get("EPS", 0)) if d.get("EPS") else None
-            result["roe"] = float(d.get("WEIGHTAVG_ROE", 0)) if d.get("WEIGHTAVG_ROE") else None
-            result["report_date"] = str(d.get("REPORT_DATE", ""))[:10]
+        df = ak.stock_financial_abstract(symbol=code)
+        if df is None or df.empty:
+            return result
     except Exception:
-        pass
+        return result
 
-    if result["eps"] is None:
-        # 备选：从新浪业绩预测页面尝试抓取
-        try:
-            url = f"http://vip.stock.finance.sina.com.cn/corp/go.php/vFD_FinanceSummary/stockid/{code}.phtml"
-            resp = requests.get(url, timeout=10)
-            resp.encoding = "gbk"
-            html = resp.text
-            eps_m = re.search(r'([\d.]+)元.*?(?:基本)?每股收益', html)
-            if not eps_m:
-                eps_m = re.search(r'(?:基本)?每股收益.*?([\d.]+)元', html)
-            if eps_m:
-                result["eps"] = float(eps_m.group(1))
-        except Exception:
-            pass
+    # 列[0]=选项, 列[1]=指标, 列[2:]=数据（最新→最旧）
+    time_cols = list(df.columns[2:])
+    if time_cols:
+        result["report_date"] = str(time_cols[0])
+
+    # ---- 1. 营业总收入 ----
+    rev_rows = df[df["指标"] == "营业总收入"]
+    if not rev_rows.empty:
+        for _, row in rev_rows.iterrows():
+            if row["选项"] in ("常用指标", "主要指标", "单季度"):
+                rev_latest = _latest_val(row, df, 0)   # 本期
+                rev_prev = _latest_val(row, df, 4)     # 去年同期（4个季度前）
+                if rev_latest and rev_prev and rev_prev > 0:
+                    result["revenue_yoy"] = round((rev_latest / rev_prev - 1) * 100, 2)
+                break
+
+    # ---- 2. 归母净利润 ----
+    profit_rows = df[df["指标"] == "归母净利润"]
+    if not profit_rows.empty:
+        for _, row in profit_rows.iterrows():
+            if row["选项"] in ("常用指标", "主要指标", "单季度"):
+                p_latest = _latest_val(row, df, 0)
+                p_prev = _latest_val(row, df, 4)
+                if p_latest and p_prev and p_prev > 0:
+                    result["profit_yoy"] = round((p_latest / p_prev - 1) * 100, 2)
+                break
+
+    # ---- 3. 基本每股收益(EPS) ----
+    eps_rows = df[df["指标"].str.contains("基本每股收益", na=False)]
+    if not eps_rows.empty:
+        for _, row in eps_rows.iterrows():
+            if row["选项"] in ("常用指标", "主要指标", "单季度"):
+                result["eps"] = _latest_val(row, df, 0)
+                break
+
+    # ---- 4. 净资产收益率(ROE) ----
+    roe_rows = df[df["指标"].str.contains("净资产收益率", na=False)]
+    if not roe_rows.empty:
+        for _, row in roe_rows.iterrows():
+            if row["选项"] in ("常用指标", "主要指标"):
+                result["roe"] = _latest_val(row, df, 0)
+                break
+
+    # ---- 5. 毛利率 ----
+    gm_rows = df[df["指标"].str.contains("毛利率", na=False)]
+    if not gm_rows.empty:
+        for _, row in gm_rows.iterrows():
+            if row["选项"] in ("主要指标", "盈利能力"):
+                result["gross_margin"] = _latest_val(row, df, 0)
+                break
 
     return result
 
 
-def batch_fetch_valuations(codes):
-    """
-    批量获取估值数据
+def _parse_financials_to_details(fin, details_业绩, scores):
+    """将财务数据填充到评分详情中"""
+    if fin.get("revenue_yoy") is not None:
+        pass_rev = fin["revenue_yoy"] >= 15
+        _update_detail(details_业绩, "营收同比>=15%", f"{fin['revenue_yoy']:+.2f}%", pass_rev)
+        if pass_rev:
+            scores["业绩"] = scores.get("业绩", 6) + 4
 
-    Args:
-        codes: list of stock codes
+    if fin.get("profit_yoy") is not None:
+        pass_profit = fin["profit_yoy"] >= 20
+        _update_detail(details_业绩, "净利润同比>=20%", f"{fin['profit_yoy']:+.2f}%", pass_profit)
+        if pass_profit:
+            scores["业绩"] = scores.get("业绩", 6) + 5
 
-    Returns:
-        dict: {code: {pe, pb, ...}}
-    """
-    results = {}
-    for code in codes:
-        try:
-            val = fetch_valuation(code)
-            if val:
-                results[code] = val
-        except Exception:
-            pass
-    return results
+    if fin.get("roe") is not None:
+        pass_roe = fin["roe"] >= 12
+        _update_detail(details_业绩, "ROE>=12%", f"{fin['roe']:.2f}%", pass_roe)
+        if pass_roe:
+            scores["业绩"] = scores.get("业绩", 6) + 3
+
+    if fin.get("eps") is not None and fin["eps"] > 0:
+        _update_detail(details_业绩, "每股收益", f"¥{fin['eps']:.2f}", True)
+
+
+def _update_detail(details, label, value, passed):
+    """更新或追加详情条目"""
+    for item in details:
+        if item["label"] == label:
+            item["value"] = value
+            item["pass"] = passed
+            return
+    details.append({"label": label, "value": value, "pass": passed})
 
 
 def enrich_with_fundamentals(score_result):
     """
-    给策略评分结果补充基本面数据（PE、营收增速等）
-    修改 score_result 中的 details 和 scores
+    给策略评分结果补充基本面数据
 
     Args:
         score_result: analyze_stock 返回的 dict
+
+    Returns:
+        修改后的 score_result
     """
     code = score_result["code"]
+
+    # 1. 估值数据（PE/PB）
     val = fetch_valuation(code)
-    fin = fetch_financial_summary(code)
-
     if val:
+        score_result["current_price"] = _latest_stock_price(code)
         pe = val.get("pe")
-        score_result["current_price"] = val.get("price")
-
-        # 更新估值维度
         details_估值 = score_result.setdefault("details", {}).setdefault("估值", [])
         scores = score_result.setdefault("scores", {})
 
         if pe is not None:
             pass_pe = pe < 30
-            # 替换 "PE(TTM)<30: 未能获取" 条目
-            for item in details_估值:
-                if item["label"] == "PE(TTM)<30":
-                    item["value"] = f"{pe:.2f}"
-                    item["pass"] = bool(pass_pe)
-                    break
-            else:
-                details_估值.append({"label": "PE(TTM)<30", "value": f"{pe:.2f}", "pass": bool(pass_pe)})
-            # 重置估值基础分，重新计算
+            _update_detail(details_估值, "PE(TTM)<30", f"{pe:.2f}", pass_pe)
+            # 先重置估值基础分
+            base = 5
             if pass_pe:
-                scores["估值"] = max(scores.get("估值", 0), 15)  # PE达标给高分
+                scores["估值"] = base + 10  # PE达标15分
             else:
-                scores["估值"] = max(scores.get("估值", 0), 5)   # 不给分
+                scores["估值"] = base
         else:
             scores["估值"] = max(scores.get("估值", 0), 5)
 
+    # 2. 财务数据（营收增速/净利润/ROE/每股收益）
+    fin = fetch_financials(code)
     if fin:
-        # 更新业绩维度
-        roe = fin.get("roe")
-        eps = fin.get("eps")
         details_业绩 = score_result.setdefault("details", {}).setdefault("业绩", [])
         scores = score_result.setdefault("scores", {})
+        _parse_financials_to_details(fin, details_业绩, scores)
 
-        score_业绩 = 6  # 基础分
+    # 如果还有PEG字段未补，标记一下
+    details_估值 = score_result.setdefault("details", {}).setdefault("估值", [])
+    has_peg = any(d["label"] == "PEG<2" for d in details_估值)
+    if not has_peg:
+        details_估值.append({"label": "PEG<2", "value": "需APP核实", "pass": None})
 
-        if roe is not None:
-            pass_roe = roe >= 12
-            for item in details_业绩:
-                if item["label"] == "ROE>=12%":
-                    item["value"] = f"{roe:.2f}%"
-                    item["pass"] = bool(pass_roe)
-                    break
-            if pass_roe:
-                score_业绩 += 5
+    # 如果还有经营现金流字段未补
+    details_业绩 = score_result.setdefault("details", {}).setdefault("业绩", [])
+    has_cf = any(d["label"] == "经营现金流为正" for d in details_业绩)
+    if not has_cf:
+        details_业绩.append({"label": "经营现金流为正", "value": "需APP核实", "pass": None})
 
-        if eps is not None and eps > 0:
-            score_业绩 += 3
-
-        detail_map = {d["label"]: d for d in details_业绩}
-
-        if "营收同比>=15%" not in detail_map:
-            details_业绩.append({"label": "营收同比>=15%", "value": "需APP核实", "pass": None})
-        if "净利润同比>=20%" not in detail_map:
-            details_业绩.append({"label": "净利润同比>=20%", "value": "需APP核实", "pass": None})
-        if "经营现金流为正" not in detail_map:
-            details_业绩.append({"label": "经营现金流为正", "value": "需APP核实", "pass": None})
-
-        scores["业绩"] = score_业绩
-
-    # 根据 PE 补充 PEG 计算
-    pass_pe = val and val.get("pe") and val["pe"] < 30
-    if val and val.get("pe") and fin and fin.get("roe"):
-        details_估值 = score_result.setdefault("details", {}).setdefault("估值", [])
-        for item in details_估值:
-            if item["label"] == "PEG<2":
-                item["value"] = f"PE={val['pe']:.1f}, ROE={fin['roe']:.1f}%"
-                # 粗略认为ROE高则PEG低
-                if val["pe"] / max(fin["roe"], 1) < 2:
-                    item["pass"] = True
-                else:
-                    item["pass"] = None
-                break
-
-    # 重新算总分
+    # 3. 重新算总分
     total = sum(scores.values())
     score_result["total"] = total
     if total >= 80:
@@ -248,16 +258,73 @@ def enrich_with_fundamentals(score_result):
     return score_result
 
 
+def _latest_stock_price(code):
+    """获取最新股价（从估值接口返回）"""
+    val = fetch_valuation(code)
+    if val:
+        return None  # push2 接口没返回 price 字段
+    return None
+
+
+def batch_fetch_valuations(codes):
+    """批量获取估值数据"""
+    results = {}
+    for code in codes:
+        try:
+            val = fetch_valuation(code)
+            if val:
+                results[code] = val
+        except Exception:
+            pass
+    return results
+
+
+def fetch_financials(code, timeout=25):
+    """
+    通过 AKShare 获取财务指标数据（带超时保护）
+
+    stock_financial_abstract 接口有时较慢，
+    使用线程超时避免整个流程挂起
+
+    Args:
+        code: 股票代码
+        timeout: 超时秒数（默认25s）
+
+    Returns:
+        dict: {revenue_yoy, profit_yoy, roe, eps, gross_margin}
+    """
+    result = {
+        "revenue_yoy": None,
+        "profit_yoy": None,
+        "roe": None,
+        "eps": None,
+        "gross_margin": None,
+        "report_date": None,
+    }
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_fetch_financials_impl, code)
+            return fut.result(timeout=timeout)
+    except FuturesTimeout:
+        pass
+    except Exception:
+        pass
+    return result
+
+
 if __name__ == "__main__":
     import json
 
-    # 测试 比亚迪
+    # 测试比亚迪
+    print("=== 比亚迪 估值 ===")
     val = fetch_valuation("002594")
-    print(f"估值: {json.dumps(val, ensure_ascii=False, indent=2)}")
+    print(json.dumps(val, ensure_ascii=False, indent=2))
 
-    fin = fetch_financial_summary("002594")
-    print(f"财务: {json.dumps(fin, ensure_ascii=False, indent=2)}")
+    print("\n=== 比亚迪 财务指标 ===")
+    fin = fetch_financials("002594")
+    print(json.dumps(fin, ensure_ascii=False, indent=2))
 
-    # 测试 中国巨石
-    val2 = fetch_valuation("600176")
-    print(f"\n中国巨石: {json.dumps(val2, ensure_ascii=False, indent=2)}")
+    # 测试伯特利
+    print("\n=== 伯特利 财务指标 ===")
+    fin2 = fetch_financials("603596")
+    print(json.dumps(fin2, ensure_ascii=False, indent=2))
