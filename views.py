@@ -26,38 +26,38 @@ def BOLD(s):
 
 
 def colorize_price(price, change_pct):
-    """根据涨跌上色"""
+    """根据涨跌上色（盈利红、亏损绿）"""
     if change_pct > 0:
-        return GREEN(f"¥{price:.2f}")
-    elif change_pct < 0:
         return RED(f"¥{price:.2f}")
+    elif change_pct < 0:
+        return GREEN(f"¥{price:.2f}")
     return f"¥{price:.2f}"
 
 
 def colorize_pct(pct):
-    """根据涨跌幅上色"""
+    """根据涨跌幅上色（涨红跌绿）"""
     if pct > 0:
-        return GREEN(f"+{pct:.2f}%")
+        return RED(f"+{pct:.2f}%")
     elif pct < 0:
-        return RED(f"{pct:.2f}%")
+        return GREEN(f"{pct:.2f}%")
     return f"{pct:.2f}%"
 
 
 def colorize_amount(amount):
-    """根据盈亏金额上色"""
+    """根据盈亏金额上色（盈利红、亏损绿）"""
     if amount > 0:
-        return GREEN(f"+¥{amount:,.2f}")
+        return RED(f"+¥{amount:,.2f}")
     elif amount < 0:
-        return RED(f"-¥{abs(amount):,.2f}")
+        return GREEN(f"-¥{abs(amount):,.2f}")
     return f"¥{amount:,.2f}"
 
 
 def colorize_profit_pct(pct):
-    """根据盈亏百分比上色"""
+    """根据盈亏百分比上色（盈利红、亏损绿）"""
     if pct > 0:
-        return GREEN(f"+{pct:.2f}%")
+        return RED(f"+{pct:.2f}%")
     elif pct < 0:
-        return RED(f"{pct:.2f}%")
+        return GREEN(f"{pct:.2f}%")
     return f"{pct:.2f}%"
 
 
@@ -77,9 +77,9 @@ def print_header():
 
 def print_row(holding):
     """打印单行持仓数据（含今日盈亏）"""
-    profit_icon = "🟢" if holding.profit >= 0 else "🔴"
-    day_icon = "🟢" if holding.day_profit >= 0 else "🔴"
-    change_color = GREEN if holding.change_pct > 0 else RED if holding.change_pct < 0 else lambda x: x
+    profit_icon = "🔴" if holding.profit >= 0 else "🟢"
+    day_icon = "🔴" if holding.day_profit >= 0 else "🟢"
+    change_color = RED if holding.change_pct > 0 else GREEN if holding.change_pct < 0 else lambda x: x
 
     row = (
         f"{holding.code:>8} {holding.name:<10} "
@@ -103,8 +103,8 @@ def print_summary(portfolio):
     total_day = portfolio.total_day_profit
     total_day_pct = portfolio.total_day_pct
 
-    profit_icon = "🟢" if total_profit >= 0 else "🔴"
-    day_icon = "🟢" if total_day >= 0 else "🔴"
+    profit_icon = "🔴" if total_profit >= 0 else "🟢"
+    day_icon = "🔴" if total_day >= 0 else "🟢"
     total_str = f"{profit_icon} {colorize_amount(total_profit)}"
     pct_str = colorize_profit_pct(total_pct)
     day_str = f"{day_icon} {colorize_amount(total_day)}"
@@ -151,7 +151,7 @@ def print_compact(portfolio):
     print("=" * 90)
 
     for h in portfolio.holdings:
-        d_icon = "🟢" if h.day_profit >= 0 else "🔴"
+        d_icon = "🔴" if h.day_profit >= 0 else "🟢"
         line = (
             f"{h.name:<8} ¥{h.price:<8.2f} "
             f"{colorize_pct(h.change_pct):>8} "
@@ -162,8 +162,8 @@ def print_compact(portfolio):
         print(line)
 
     print("-" * 90)
-    d_icon = "🟢" if portfolio.total_day_profit >= 0 else "🔴"
-    p_icon = "🟢" if portfolio.total_profit >= 0 else "🔴"
+    d_icon = "🔴" if portfolio.total_day_profit >= 0 else "🟢"
+    p_icon = "🔴" if portfolio.total_profit >= 0 else "🟢"
     print(
         f"{'合计':<8} 市值 ¥{portfolio.total_market_value:<10,.2f} "
         f"| 今日 {d_icon} {colorize_amount(portfolio.total_day_profit):>10} "
