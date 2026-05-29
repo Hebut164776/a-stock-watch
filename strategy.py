@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 
 from fetcher import fetch_sina_batch
+from fundamental import enrich_with_fundamentals, fetch_valuation
 
 
 def fetch_sina_kline(code, days=300):
@@ -344,6 +345,11 @@ def analyze_batch(codes):
     for code in codes:
         try:
             r = analyze_stock(code)
+            # 补充基本面数据（PE/PB/营收增速等）
+            try:
+                r = enrich_with_fundamentals(r)
+            except Exception:
+                pass
             results.append(r)
         except Exception as e:
             results.append({"code": code, "name": "?", "total": 0, "error": str(e)})
