@@ -1,0 +1,17 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 配置文件含成本价，不提交
+config.yaml
+
+# 评分历史（无敏感信息但属于运行时数据）
+score_history.json
+
+# 技能数据中的持仓副本
+skills/a-stock-portfolio-monitor/data/stocks.json
+
+# 系统文件
+Thumbs.db
+.DS_Store
