@@ -165,6 +165,15 @@ def main():
     # --history 走历史查询，不需要加载持仓
     if args.history is not None:
         code = None if args.history == "__all__" else args.history
+        # 支持名称别名
+        if code:
+            try:
+                holdings, cfg = load_config(args.config)
+                name_map = {s["name"]: s["code"] for s in cfg.get("stocks", []) if s.get("name")}
+                if code in name_map:
+                    code = name_map[code]
+            except Exception:
+                pass
         print(show_score_history(code))
         return
 

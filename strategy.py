@@ -1,65 +1,26 @@
 """
 策略分析模块 - 个股五维打分 & 卖出规则监控
 
-集成自 stock-investment-strategy 技能的 analyze.py
-但这里直接复用函数，避免跨目录依赖。
+数据获取复用 fetcher.py 的批量接口（消除重复代码）
 """
 
 import sys
-import os
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-import requests
 import pandas as pd
+import requests
 
-# 添加策略分析脚本路径
-SKILL_ANALYZE = Path(r"D:\claw\openclaw\skills\stock-investment-strategy\analyze.py")
-
-# ---------- 数据获取（复制自 analyze.py，避免跨目录 import 的麻烦） ----------
-
-def fetch_sina_multi(codes):
-    """批量从新浪获取实时行情"""
-    sh_codes = [c for c in codes if c.startswith(("6", "9"))]
-    sz_codes = [c for c in codes if not c.startswith(("6", "9"))]
-    result = {}
-    for market, group in [("sh", sh_codes), ("sz", sz_codes)]:
-        if not group:
-            continue
-        url = f"http://hq.sinajs.cn/list={','.join(market + c for c in group)}"
-        headers = {"Referer": "https://finance.sina.com.cn"}
-        try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            resp.encoding = "gbk"
-            for line in resp.text.strip().split("\n"):
-                if "=" in line:
-                    parts = line.split('"')
-                    if len(parts) >= 2:
-                        fields = parts[1].split(",")
-                        if len(fields) >= 32:
-                            code_raw = line.split("=")[0].split("_")[-1]
-                            code = code_raw[2:] if code_raw.startswith(("sh", "sz")) else code_raw
-                            result[code] = {
-                                "name": fields[0],
-                                "open": float(fields[1]) if fields[1] else 0,
-                                "yclose": float(fields[2]) if fields[2] else 0,
-                                "price": float(fields[3]) if fields[3] else 0,
-                                "high": float(fields[4]) if fields[4] else 0,
-                                "low": float(fields[5]) if fields[5] else 0,
-                                "volume": int(fields[8]) if fields[8] else 0,
-                                "amount": float(fields[9]) if fields[9] else 0,
-                            }
-        except Exception:
-            pass
-    return result
+from fetcher import fetch_sina_batch
 
 
 def fetch_sina_kline(code, days=300):
     """从新浪获取日K线数据"""
     market = "sh" if code.startswith(("6", "9")) else "sz"
-    url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={market}{code}&scale=240&ma=no&datalen={days}"
+    url = (f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"CN_MarketData.getKLineData?symbol={market}{code}&scale=240&ma=no&datalen={days}")
     try:
         resp = requests.get(url, timeout=10)
         data = resp.json()
@@ -79,7 +40,8 @@ def fetch_sina_kline(code, days=300):
 
 def fetch_index_kline(code="000300", days=300):
     """获取指数K线"""
-    url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=sh{code}&scale=240&ma=no&datalen={days}"
+    url = (f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"CN_MarketData.getKLineData?symbol=sh{code}&scale=240&ma=no&datalen={days}")
     try:
         resp = requests.get(url, timeout=10)
         data = resp.json()
@@ -125,8 +87,9 @@ def check_breakout(df):
 def analyze_stock(code):
     """对单只股票执行五维打分，返回得分详情"""
     code = code.strip()
-    quotes = fetch_sina_multi([code])
-    quote = quotes.get(code)
+    quotes = fetch_sina_batch([code])
+    quote_dict = quotes.get(code)
+    quote = quote_dict.to_dict() if quote_dict else None
     name = quote["name"] if quote else code
 
     scores = {"大盘": 0, "行业": 0, "业绩": 0, "估值": 0, "走势": 0}
@@ -154,7 +117,16 @@ def analyze_stock(code):
         details["大盘"].append({"label": "沪深300", "value": "获取失败", "pass": False})
 
     # ===== 2. 行业 =====
-    industry_hint = "上海主板" if code.startswith("6") else "深圳" if code.startswith("00") else "创业板" if code.startswith("30") else "科创板" if code.startswith("68") else "未知"
+    if code.startswith("6"):
+        industry_hint = "上海主板"
+    elif code.startswith("00"):
+        industry_hint = "深圳"
+    elif code.startswith("30"):
+        industry_hint = "创业板"
+    elif code.startswith("68"):
+        industry_hint = "科创板"
+    else:
+        industry_hint = "未知"
     details["行业"].append({"label": "市场板块", "value": industry_hint, "pass": True})
     scores["行业"] += 10
 
@@ -176,7 +148,6 @@ def analyze_stock(code):
     fin_info = {}
     if quote:
         try:
-            market = "sh" if code.startswith(("6", "9")) else "sz"
             url = f"http://money.finance.sina.com.cn/corp/go.php/vFD_FinanceSummary/stockid/{code}.phtml"
             resp = requests.get(url, timeout=10)
             resp.encoding = "gbk"
@@ -197,7 +168,6 @@ def analyze_stock(code):
         price = quote["price"]
         pe_val = None
         try:
-            market = "sh" if code.startswith(("6", "9")) else "sz"
             url = f"http://vip.stock.finance.sina.com.cn/corp/go.php/vFD_FinanceSummary/stockid/{code}.phtml"
             resp = requests.get(url, timeout=10)
             resp.encoding = "gbk"
@@ -280,37 +250,29 @@ def analyze_stock(code):
 
 class SellSignals:
     """按策略文档定义的三条卖出规则"""
-    STOP_LOSS_PCT = -8.0       # 跌到-8%止损
-    TAKE_PROFIT_PCT = 20.0     # 涨到+20%卖一半
-    MA50_EXIT = True           # 剩下的一半跌破50日线卖出
+    STOP_LOSS_PCT = -8.0
+    TAKE_PROFIT_PCT = 20.0
+    MA50_EXIT = True
 
     @classmethod
     def check(cls, holding, ma50=None):
-        """
-        检查持仓是否触发卖出信号
-        返回 list of (signal_type, message)
-        """
+        """检查持仓是否触发卖出信号"""
         signals = []
         if holding.price <= 0:
             return signals
 
-        # 规则1: -8%止损
         if holding.profit_pct <= cls.STOP_LOSS_PCT:
             signals.append(("stop_loss",
                 f"😵 止损！{holding.name}({holding.code}) 亏损{holding.profit_pct:.1f}% ≤ -8%"))
 
-        # 规则2: +20%止盈一半
         if holding.profit_pct >= cls.TAKE_PROFIT_PCT:
             signals.append(("take_profit",
                 f"💰 止盈！{holding.name}({holding.code}) 盈利{holding.profit_pct:.1f}% ≥ +20%，建议卖一半"))
 
-        # 规则3: 跌破50日线
         if cls.MA50_EXIT and ma50 is not None and holding.price > 0:
-            if holding.price < ma50:
-                # 已持有且有盈利的情况
-                if holding.profit_pct > 0:
-                    signals.append(("ma50_exit",
-                        f"📉 {holding.name}({holding.code}) 跌破50日线(¥{ma50:.2f})，剩余仓位建议卖出"))
+            if holding.price < ma50 and holding.profit_pct > 0:
+                signals.append(("ma50_exit",
+                    f"📉 {holding.name}({holding.code}) 跌破50日线(¥{ma50:.2f})，剩余仓位建议卖出"))
 
         return signals
 
@@ -321,50 +283,41 @@ RECORDS_FILE = Path(__file__).parent / "score_history.json"
 
 
 def load_score_history():
-    """加载评分历史"""
     if RECORDS_FILE.exists():
         try:
             with open(RECORDS_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, Exception):
+        except Exception:
             return {}
     return {}
 
 
 def save_score_history(records):
-    """保存评分历史"""
     RECORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(RECORDS_FILE, "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
 def record_score(result):
-    """记录一次评分到历史"""
     records = load_score_history()
     code = result["code"]
     today = datetime.now().strftime("%Y-%m-%d %H:%M")
-
     if code not in records:
         records[code] = []
-
     records[code].append({
         "date": today,
         "total": result["total"],
         "scores": result["scores"],
         "price": result["current_price"],
     })
-
-    # 每只保留最近20条
     records[code] = records[code][-20:]
     save_score_history(records)
 
 
 def show_score_history(code=None):
-    """显示评分历史"""
     records = load_score_history()
     if not records:
         return "暂无评分记录"
-
     lines = []
     if code:
         code = code.strip()
@@ -381,14 +334,12 @@ def show_score_history(code=None):
         for c, items in sorted(records.items()):
             last = items[-1]
             lines.append(f"  {c}  最近: {last['total']}分  ({last['date']})")
-
     return "\n".join(lines)
 
 
 # ---------- 批量分析 ----------
 
 def analyze_batch(codes):
-    """批量分析多只股票，返回排序结果"""
     results = []
     for code in codes:
         try:
@@ -396,25 +347,20 @@ def analyze_batch(codes):
             results.append(r)
         except Exception as e:
             results.append({"code": code, "name": "?", "total": 0, "error": str(e)})
-
     results.sort(key=lambda x: x.get("total", 0), reverse=True)
     return results
 
 
 def format_batch_table(results):
-    """格式化批量对比表格"""
     lines = ["📊 **多股评分对比**", "```"]
     lines.append(f"{'排名':>4} {'代码':>6} {'名称':<8} {'总分':>4} {'大盘':>4} {'行业':>4} {'业绩':>4} {'估值':>4} {'走势':>4}  建议")
     lines.append("-" * 70)
     for i, r in enumerate(results, 1):
         s = r.get("scores", {})
-        line = (
-            f"{i:>4} {r['code']:>6} {r['name']:<8} "
-            f"{r.get('total', 0):>4} "
-            f"{s.get('大盘', 0):>4} {s.get('行业', 0):>4} "
-            f"{s.get('业绩', 0):>4} {s.get('估值', 0):>4} "
-            f"{s.get('走势', 0):>4}  {r.get('conclusion', '?')}"
-        )
+        line = (f"{i:>4} {r['code']:>6} {r['name']:<8} {r.get('total', 0):>4} "
+                f"{s.get('大盘', 0):>4} {s.get('行业', 0):>4} "
+                f"{s.get('业绩', 0):>4} {s.get('估值', 0):>4} "
+                f"{s.get('走势', 0):>4}  {r.get('conclusion', '?')}")
         lines.append(line)
     lines.append("```")
     return "\n".join(lines)
@@ -433,10 +379,8 @@ def run_strategy(holdings):
         sr = score_map.get(h.code, {})
         ma_data = sr.get("ma_data", {})
         ma50 = ma_data.get("ma50")
-        signals = SellSignals.check(h, ma50)
-        all_signals.extend(signals)
+        all_signals.extend(SellSignals.check(h, ma50))
 
-    # 记录评分历史
     for r in scores:
         if r.get("total", 0) > 0:
             record_score(r)
@@ -445,15 +389,11 @@ def run_strategy(holdings):
 
 
 if __name__ == "__main__":
-    # 测试
     codes = sys.argv[1:]
     if not codes:
         print("用法: python strategy.py <代码1> <代码2> ...")
-        print("示例: python strategy.py 002594 002245")
         sys.exit(1)
-
     results = analyze_batch(codes)
     print(format_batch_table(results))
-    print()
     for r in results:
         print(f"\n📈 {r['name']}({r['code']})  总分{r['total']}/100  {r['conclusion']}")

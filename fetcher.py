@@ -4,6 +4,7 @@ A股实时行情数据抓取模块
 """
 
 import re
+import time
 import requests
 
 # 数据源接口地址
@@ -11,6 +12,7 @@ URLS = {
     "sina": {
         "sh": "http://hq.sinajs.cn/list=sh{code}",
         "sz": "http://hq.sinajs.cn/list=sz{code}",
+        "batch": "http://hq.sinajs.cn/list=",  # 逗号拼接 sh600519,sh000001
     },
     "tencent": {
         "sh": "http://qt.gtimg.cn/q=sh{code}",
@@ -35,6 +37,33 @@ HEADERS = {
 }
 
 
+def detect_market(code):
+    """根据股票代码判断市场"""
+    code = str(code).strip()
+    if code.startswith(("6", "9")):
+        return "sh"
+    elif code.startswith(("0", "2", "3")):
+        return "sz"
+    return "sh"
+
+
+def _retry(fn, max_retries=3, delay=1, backoff=2):
+    """带指数退避的重试包装器"""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                wait = delay * (backoff ** attempt)
+                time.sleep(wait)
+        except (ValueError, IndexError, TypeError) as e:
+            last_exc = e
+            break  # 解析错误不重试
+    raise last_exc
+
+
 class StockQuote:
     """股票实时行情数据结构"""
 
@@ -57,6 +86,19 @@ class StockQuote:
             f"{self.name}({self.code}): ¥{self.price:.2f} "
             f"{self.change_pct:+.2f}%"
         )
+
+    def to_dict(self):
+        """转字典，方便其他模块使用"""
+        return {
+            "name": self.name,
+            "open": self.open_price,
+            "yclose": self.prev_close,
+            "price": self.price,
+            "high": self.high,
+            "low": self.low,
+            "volume": self.volume,
+            "amount": self.amount,
+        }
 
 
 def _parse_sina_stock(data_str):
@@ -159,7 +201,7 @@ def _parse_eastmoney_stock(data):
 
 def fetch_single(code, market="sh", source="sina"):
     """
-    获取单只股票的实时行情
+    获取单只股票的实时行情（带重试）
 
     Args:
         code: 股票代码，如 "600519"
@@ -169,7 +211,7 @@ def fetch_single(code, market="sh", source="sina"):
     Returns:
         StockQuote 对象，失败返回 None
     """
-    try:
+    def _do_fetch():
         if source == "sina":
             url = URLS["sina"][market].format(code=code)
             resp = requests.get(url, headers=HEADERS, timeout=5)
@@ -196,13 +238,62 @@ def fetch_single(code, market="sh", source="sina"):
                 headers=HEADERS, timeout=5,
             )
             return _parse_eastmoney_stock(resp.json())
+        return None
 
-    except requests.RequestException as e:
-        print(f"  [!] 网络请求失败: {e}")
+    try:
+        return _retry(_do_fetch, max_retries=3, delay=1)
     except Exception as e:
-        print(f"  [!] 解析失败: {e}")
+        return None
 
-    return None
+
+def fetch_sina_batch(codes):
+    """
+    批量从新浪获取行情（一次HTTP请求）
+
+    新浪支持一次请求多个股票，用逗号拼接即可
+    相比串行逐个请求效率更高
+
+    Args:
+        codes: list of str, 股票代码列表如 ["600519", "002594"]
+
+    Returns:
+        dict: {code: StockQuote}
+    """
+    if not codes:
+        return {}
+
+    sh_codes = [c for c in codes if c.startswith(("6", "9"))]
+    sz_codes = [c for c in codes if not c.startswith(("6", "9"))]
+    result = {}
+
+    def _fetch_group(market, group):
+        url = URLS["sina"]["batch"] + ",".join(market + c for c in group)
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.encoding = "gbk"
+        for line in resp.text.strip().split("\n"):
+            if "=" not in line:
+                continue
+            parts = line.split('"')
+            if len(parts) >= 2:
+                fields = parts[1].split(",")
+                if len(fields) >= 32:
+                    code_raw = line.split("=")[0].split("_")[-1]
+                    raw = code_raw[2:] if code_raw.startswith(("sh", "sz")) else code_raw
+                    if raw in group:
+                        quote = _parse_sina_stock(line)
+                        if quote:
+                            quote.code = raw
+                            result[raw] = quote
+
+    try:
+        if sh_codes:
+            _retry(lambda: _fetch_group("sh", sh_codes), max_retries=2, delay=1)
+        if sz_codes:
+            _retry(lambda: _fetch_group("sz", sz_codes), max_retries=2, delay=1)
+    except Exception:
+        pass
+
+    return result
 
 
 def fetch_batch(stock_list, source="sina"):
@@ -216,6 +307,12 @@ def fetch_batch(stock_list, source="sina"):
     Returns:
         dict: {code: StockQuote}
     """
+    if source == "sina":
+        # 新浪支持一次查询，比串行快
+        codes = [item["code"] for item in stock_list]
+        return fetch_sina_batch(codes)
+
+    # 非新浪源回退到串行
     results = {}
     for item in stock_list:
         code = item["code"]
@@ -237,5 +334,9 @@ if __name__ == "__main__":
         print(quote)
         print(f"  开盘: {quote.open_price}  最高: {quote.high}  最低: {quote.low}")
         print(f"  成交量: {quote.volume:.0f}手  成交额: {quote.amount:.0f}万")
-    else:
-        print("查询失败")
+
+    # 测试批量
+    print("\n批量测试:")
+    batch = fetch_sina_batch(["600519", "002594", "000001"])
+    for code, q in batch.items():
+        print(f"  {q}")

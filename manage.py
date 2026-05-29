@@ -350,12 +350,37 @@ def cmd_import_stocks(args):
     print(f"✅ 从技能导入完成: 新增 {new_count}, 更新 {update_count}")
 
 
+def _resolve_code(user_input):
+    """接受股票代码或名称，返回代码列表"""
+    if not user_input:
+        return []
+    inputs = [u.strip() for u in user_input]
+    # 先建一个名称->代码映射
+    config = load_config_raw()
+    name_map = {}
+    for s in config.get("stocks", []):
+        name = s.get("name", "")
+        if name:
+            name_map[name] = s["code"]
+            name_map[name.lower()] = s["code"]
+    # 解析
+    resolved = []
+    for inp in inputs:
+        if inp in name_map:
+            resolved.append(name_map[inp])
+        elif inp.lower() in name_map:
+            resolved.append(name_map[inp.lower()])
+        else:
+            resolved.append(inp)  # 直接当代码用
+    return resolved
+
+
 def cmd_score(args):
-    """五维打分分析"""
+    """五维打分分析（支持名称别名）"""
     from strategy import analyze_batch, format_batch_table, record_score
 
     if args.codes:
-        codes = [c.strip() for c in args.codes]
+        codes = _resolve_code(args.codes)
     else:
         config = load_config_raw()
         codes = [s["code"] for s in config.get("stocks", [])]
@@ -498,9 +523,14 @@ def main():
 
 
 def cmd_history(args):
-    """查看评分历史"""
+    """查看评分历史（支持名称别名）"""
     from strategy import show_score_history
-    print(show_score_history(args.code))
+    if args.code:
+        codes = _resolve_code([args.code])
+        code = codes[0] if codes else args.code
+    else:
+        code = None
+    print(show_score_history(code))
 
 
 if __name__ == "__main__":
